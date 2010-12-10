@@ -35,6 +35,13 @@ var a = [1, 2, 3, 4];
 a.push(a);
 testCircular(a);
 
+// Make sure we're not catching this case
+var a = [1, 2, 3, 4];
+var b = [1];
+a.push(b);
+a.push(b);
+testEqual(a);
+
 // Make sure we're catching circular references in objects
 var d = {}
 d.qqq = d;

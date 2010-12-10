@@ -5,7 +5,8 @@
 #include <node_buffer.h>
 #include <msgpack.h>
 #include <math.h>
-#include <vector>
+#include <list>
+#include <assert.h>
 
 using namespace v8;
 using namespace node;
@@ -56,40 +57,24 @@ class MsgpackSbuffer {
 };
 
 // Object to check for cycles when packing.
-//
-// The implementation tracks all previously-seen values in an unordered
-// std::vector and performs a simple membership check using
-// v8::Value::StrictEquals(). Thus, serialization requires O(n^2) checks where
-// n is the number of array/object instances found in the object being
-// serialized. This is lame.
-//
-// XXX: Change this to a std::multimap based on v8::Object::GetIdentityHash()
-//      to reduce the search space. This should get us down to O(n log n) with
-//      a std::multimap built on top of a RBT or similar.
-//
-// XXX: An even better fix for this would be to use
-//      v8::Object::SetHiddenValue(), but this causes memory leaks for some
-//      reason (see http://github.com/pgriess/node-msgpack/issues/#issue/4)
 class MsgpackCycle {
     public:
         MsgpackCycle() {
         }
 
         ~MsgpackCycle() {
+            assert(_objs.empty());
             _objs.clear();
         }
 
-        void check(Handle<Value> v) {
-            if (!v->IsArray() && !v->IsObject()) {
-                return;
-            }
+        void enter(Handle<Value> v) {
+            Handle<Value> o = v;
 
-            Handle<Object> o = v->ToObject();
-
-            for (std::vector< Handle<Object> >::iterator iter = _objs.begin();
+            for (std::list< Handle<Value> >::iterator iter = _objs.begin();
                  iter != _objs.end();
                  iter++) {
                 if ((*iter)->StrictEquals(o)) {
+                    this->out();
                     // This message should not change without updating
                     // test/test.js to expect the new text
                     throw MsgpackException( \
@@ -101,8 +86,12 @@ class MsgpackCycle {
             _objs.push_back(o);
         }
 
+        void out() {
+            _objs.pop_back();
+        }
+
     private:
-        std::vector< Handle<Object> > _objs;
+        std::list< Handle<Value> > _objs;
 };
 
 #define DBG_PRINT_BUF(buf, name) \
@@ -133,7 +122,6 @@ class MsgpackCycle {
 static void
 v8_to_msgpack(Handle<Value> v8obj, msgpack_object *mo, msgpack_zone *mz,
               MsgpackCycle *mc) {
-    mc->check(v8obj);
 
     if (v8obj->IsUndefined() || v8obj->IsNull()) {
         mo->type = MSGPACK_OBJECT_NIL;
@@ -154,13 +142,15 @@ v8_to_msgpack(Handle<Value> v8obj, msgpack_object *mo, msgpack_zone *mz,
         }
     } else if (v8obj->IsString()) {
         mo->type = MSGPACK_OBJECT_RAW;
-        mo->via.raw.size = DecodeBytes(v8obj, UTF8);
+        String::Utf8Value utf8value(v8obj);
+        mo->via.raw.size = utf8value.length();
         mo->via.raw.ptr = (char*) msgpack_zone_malloc(mz, mo->via.raw.size);
 
-        DecodeWrite((char*) mo->via.raw.ptr, mo->via.raw.size, v8obj, UTF8);
+        memcpy((char*) mo->via.raw.ptr, *utf8value, mo->via.raw.size);
     } else if (v8obj->IsArray()) {
-        Local<Object> o = v8obj->ToObject();
-        Local<Array> a = Local<Array>::Cast(o);
+        mc->enter(v8obj);
+
+        Handle<Array> a = Handle<Array>::Cast(v8obj);
 
         mo->type = MSGPACK_OBJECT_ARRAY;
         mo->via.array.size = a->Length();
@@ -169,18 +159,21 @@ v8_to_msgpack(Handle<Value> v8obj, msgpack_object *mo, msgpack_zone *mz,
             sizeof(msgpack_object) * mo->via.array.size
         );
 
-        for (uint32_t i = 0; i < a->Length(); i++) {
-            Local<Value> v = a->Get(i);
-            v8_to_msgpack(v, &mo->via.array.ptr[i], mz, mc);
+        for (uint32_t i = 0, l = a->Length(); i < l; i++) {
+            v8_to_msgpack(a->Get(i), &mo->via.array.ptr[i], mz, mc);
         }
+
+        mc->out();
     } else if (Buffer::HasInstance(v8obj)) {
-        Local<Object> buf = v8obj->ToObject();
+        Handle<Object> buf = Handle<Object>::Cast(v8obj);
 
         mo->type = MSGPACK_OBJECT_RAW;
         mo->via.raw.size = Buffer::Length(buf);
         mo->via.raw.ptr = Buffer::Data(buf);
     } else {
-        Local<Object> o = v8obj->ToObject();
+        mc->enter(v8obj);
+
+        Handle<Object> o = Handle<Object>::Cast(v8obj);
         Local<Array> a = o->GetPropertyNames();
 
         mo->type = MSGPACK_OBJECT_MAP;
@@ -190,12 +183,14 @@ v8_to_msgpack(Handle<Value> v8obj, msgpack_object *mo, msgpack_zone *mz,
             sizeof(msgpack_object_kv) * mo->via.map.size
         );
 
-        for (uint32_t i = 0; i < a->Length(); i++) {
+        for (uint32_t i = 0, l = a->Length(); i < l; i++) {
             Local<Value> k = a->Get(i);
 
             v8_to_msgpack(k, &mo->via.map.ptr[i].key, mz, mc);
             v8_to_msgpack(o->Get(k), &mo->via.map.ptr[i].val, mz, mc);
         }
+
+        mc->out();
     }
 }
 
@@ -288,8 +283,7 @@ pack(const Arguments &args) {
         }
     }
 
-    Buffer *bp = Buffer::New(sb._sbuf.size);
-    memcpy(bp->data(), sb._sbuf.data, sb._sbuf.size);
+    Buffer *bp = Buffer::New(sb._sbuf.data, sb._sbuf.size);
 
     return scope.Close(bp->handle_);
 }
@@ -311,19 +305,19 @@ unpack(const Arguments &args) {
             String::New("First argument must be a Buffer")));
     }
 
-    Buffer *buf = ObjectWrap::Unwrap<Buffer>(args[0]->ToObject());
+    Handle<Object> buf = args[0]->ToObject();
 
     MsgpackZone mz;
     msgpack_object mo;
     size_t off = 0;
 
-    switch (msgpack_unpack(buf->data(), buf->length(), &off, &mz._mz, &mo)) {
+    switch (msgpack_unpack(Buffer::Data(buf), Buffer::Length(buf), &off, &mz._mz, &mo)) {
     case MSGPACK_UNPACK_EXTRA_BYTES:
     case MSGPACK_UNPACK_SUCCESS:
         try {
             msgpack_unpack_template->GetFunction()->Set(
                 msgpack_bytes_remaining_symbol,
-                Integer::New(buf->length() - off)
+                Integer::New(Buffer::Length(buf) - off)
             );
             return scope.Close(msgpack_to_v8(&mo));
         } catch (MsgpackException e) {
